@@ -105,7 +105,7 @@ def parse_args(args):
     parser.add_argument('--prune_rate_decay', type=str, default='cosine', help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
     parser.add_argument('--density_decay', type=str, default='constant', help='The decay schedule for the density. If not constant, will start training with density=1 and decay to --density. Default: constant. Choose from: constant, linear, cosine.')
     parser.add_argument('--initial_density', type=float, default=0.999, help='The initial density for the density decay schedule. Only used when density_decay!=constant. Default: 0.999.')
-    parser.add_argument('--fix', action='store_true', help='Fix topology during training. Default: True.')
+    parser.add_argument('--fix', type=str2bool, default=False, help='Fix topology during training. Default: False.')
     parser.add_argument('--sparse_init', type=str, default='Multi_Output', help='sparse initialization')
     parser.add_argument('--mix', type=float, default=0.0)
     parser.add_argument('--temperature_decay', type=str, default='constant', help='The decay schedule for the temperature. Choose from: constant, linear.')
