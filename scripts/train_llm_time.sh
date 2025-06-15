@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --gpus=1
-#SBATCH -t 40:00:00
+#SBATCH -t 30:00:00
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=60G
 
@@ -18,7 +18,7 @@ export POST_NUM=3
 
 get_free_port() {
   while :; do
-    port=$((52000 + RANDOM % 10000))
+    port=$((15000 + RANDOM % 10000))
     if ! lsof -i:$port >/dev/null 2>&1; then
       echo $port
       return
@@ -29,31 +29,42 @@ get_free_port() {
 master_port=$(get_free_port)
 
 # size="350m"
-for size in "250m"; do
-for density in 0.5; do
-for epochs in 4; do
+for size in "100m"; do
+for epochs in 2; do
 for training_steps in 10000; do
 for prune_rate in 0.1; do
 for update_freq in 100; do
 
+# Set density based on model size
+if [[ "$size" == "60m" ]]; then
+  density=1.0
+elif [[ "$size" == "100m" ]]; then
+  density=0.5
+elif [[ "$size" == "250m" ]]; then
+  density=0.25
+else
+  echo "Unknown model size: $size"
+  exit 1
+fi
+
+
 model_name='llama'
 
 seed=0
-optimizer="adam"
-weight_decay=0.0
 learning_rate=1e-3
-
 batch=256
 growth="gradient"      # SET: "random", RigL: "gradient"
-prune="magnitude"  # "magnitude_soft" or "magnitude"; "Taylor_FO"
+prune="magnitude"  # "magnitude_soft" or "magnitude"
 temperature=3.0
-am_ratio=0.8
+
+fix=False
+prune_rate_decay="cosine"  # constant, cosine, WSD
+am_ratio=0.9
 sparse_init="uniform_ratio"  # fixed_ERK; uniform; uniform_ratio
 
-prune_rate_decay="cosine"  # constant, cosine, WSD
 warmup_steps=1000
 
-run_name="${size}_s${seed}_${master_port}"
+run_name="${size}_s${seed}"
 
 max_length=256
 total_batch_size=512
@@ -61,7 +72,7 @@ total_batch_size=512
 data_dir="/scratch-shared/xiaoq/c4_sampling/c4_filtered_maxlength${max_length}_bs${total_batch_size}_step${training_steps}_arrow_shuffle32"
 #data_dir=None
 
-output_dir="/scratch-shared/xiaoq/dst_llms/model_${model_name}${size}_c4_f_l${max_length}_bs${total_batch_size}_step${training_steps}_g${growth}_p${prune}${prune_rate}_${prune_rate_decay}_f${update_freq}_d${density}_init${sparse_init}_am${am_ratio}_wp${warmup_steps}_lr${learning_rate}_ep${epochs}_steps${training_steps}_op${optimizer}_wd${weight_decay}_exfl"
+output_dir="/scratch-shared/xiaoq/dst_llms_hy/model_${model_name}${size}_c4_f_l${max_length}_bs${total_batch_size}_step${training_steps}_g${growth}_p${prune}${prune_rate}_${prune_rate_decay}_f${update_freq}_d${density}_init${sparse_init}_am${am_ratio}_fix${fix}_wp${warmup_steps}_lr${learning_rate}_ep${epochs}_steps${training_steps}_exfl"
 
 mkdir -p ${output_dir}/checkpoints
 
@@ -72,7 +83,10 @@ log_file="${output_dir}/log.txt"
     echo "Master port: ${master_port}"
     echo "Run name: ${run_name}"
 
-torchrun --standalone --nproc_per_node 1 --master_port=${master_port} torchrun_main.py \
+python -m torch.distributed.launch \
+    --nproc_per_node=1 \
+    --master_port=${master_port} \
+    --use_env torchrun_main.py \
     --wandb_mode disabled \
     --seed $seed \
     --model_config "configs/llama_${size}.json" \
@@ -86,14 +100,13 @@ torchrun --standalone --nproc_per_node 1 --master_port=${master_port} torchrun_m
     --temperature $temperature \
     --sparse_init ${sparse_init} \
     --am_ratio ${am_ratio} \
+    --fix ${fix} \
     --lr $learning_rate \
-    --optimizer $optimizer \
     --batch_size $batch \
     --total_batch_size $total_batch_size \
     --num_training_steps $training_steps \
     --epochs $epochs \
     --warmup_steps $warmup_steps \
-    --weight_decay ${weight_decay} \
     --dtype bfloat16 \
     --grad_clipping 0.0 \
     --run_name $run_name \
@@ -105,7 +118,6 @@ echo "========== Job finished at $(date) =========="
     echo "ERROR: Job failed at $(date)" | tee -a $log_file
 }
 
-done
 done
 done
 done

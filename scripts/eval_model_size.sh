@@ -14,7 +14,7 @@ export NORM_TYPE="pre"
 export POST_NUM=3
 
 # size="350m"
-for size in "60m"; do
+for size in "480m"; do
 for density in 1.0; do
 for epochs in 1; do
 for training_steps in 100; do

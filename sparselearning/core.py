@@ -434,6 +434,8 @@ class Masking(object):
                     # prune
                     if self.prune_mode == 'magnitude':
                         new_mask = self.magnitude_prune(mask, weight, name)
+                    elif self.prune_mode == 'magnitude_inverse':
+                        new_mask = self.magnitude_inverse_prune(mask, weight, name)
                     elif self.prune_mode == 'magnitude_soft':
                         new_mask = self.magnitude_soft_prune(weight, name)
                     elif self.prune_mode == 'SET':
@@ -583,6 +585,26 @@ class Masking(object):
         threshold = x[k-1].item()
 
         return (torch.abs(weight.data) > threshold)
+
+    def magnitude_inverse_prune(self, mask, weight, name):
+        prune_rate = self.name2prune_rate[name]
+        current_mask = self.masks[name]
+
+        # 获取当前非零权重
+        active_weights = weight.data[current_mask.bool()]
+        num_active = active_weights.numel()
+
+        num_keep = math.ceil((1 - prune_rate) * num_active)
+        if num_keep <= 0:
+            return torch.zeros_like(current_mask)
+
+        # 保留最小的部分
+        threshold = torch.topk(torch.abs(active_weights), num_keep, largest=False).values.max()
+
+        # 新 mask：只保留小于等于 threshold 的原始非零权重
+        new_mask = current_mask.clone()
+        new_mask[(torch.abs(weight.data) > threshold) & (current_mask.bool())] = 0
+        return new_mask
 
     def magnitude_soft_prune(self, weight, name):
         """
