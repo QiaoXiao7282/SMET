@@ -5,6 +5,12 @@ import numpy as np
 import math
 import wandb
 from sparselearning.decay import CosineDecay, LinearDecay, ConstantDecay, WSDDecay
+from transformers import AutoConfig, AutoTokenizer, default_data_collator
+import torch.distributed as dist
+from peft_pretraining import training_utils, args_utils
+from sparselearning.optimizer import AdamDST
+
+import datasets
 
 
 class Masking(object):
@@ -21,16 +27,18 @@ class Masking(object):
     """
     def __init__(
             self,
-            optimizer,
+            preprocess_batched,
+            pad_idx,
             growth_prune_ratio=1.0,
             redistribution_mode='none',
             threshold=0.001,
             args=None,
             distributed=False,
             device=None,
+            global_rank=0,
+            world_size=0
     ):
         self.args = args
-        self.optimizer = optimizer
         self.distributed = distributed
         if device is None:
             self.device = torch.device('cuda')
@@ -63,6 +71,12 @@ class Masking(object):
         self.adjustments = []
         self.baseline_nonzero = None
         self.name2baseline_nonzero = {}
+
+        self.preprocess_batched = preprocess_batched
+        self.pad_idx = pad_idx
+        self.global_rank = global_rank
+        self.world_size = world_size
+
 
         # stats
         self.name2variance = {}
@@ -111,7 +125,7 @@ class Masking(object):
                     if name not in self.masks: continue
                     self.masks[name][:] = (torch.rand(weight.shape) < density).float().data.cuda() #lsw
                     self.baseline_nonzero += weight.numel()*density
-            self.apply_mask()
+            # self.apply_mask()
 
         elif self.sparse_init == 'fixed_ERK':
             print('initialize by fixed_ERK')
@@ -233,7 +247,7 @@ class Masking(object):
                 self.masks[name][:] = (torch.rand(weight.shape) < d_mlp).float().data.cuda()
                 self.baseline_nonzero += weight.numel() * d_mlp
 
-        self.apply_mask()
+        # self.apply_mask()
         self.fired_masks = copy.deepcopy(self.masks) # used for over-paremeters
 
         self.init_prune_rate(self.prune_rate)
@@ -264,6 +278,24 @@ class Masking(object):
             total_weights = mask.numel()
             density = num_nonzero / total_weights
             self.name2density[name] = density
+
+    def setting_optimizer(self, model):
+        if self.args.optimizer.lower() == "adam":
+            self.optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
+        elif self.args.optimizer.lower() == "adamw":
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.args.lr)
+        elif self.args.optimizer.lower() == "adamdst":
+            self.optimizer = AdamDST(model.parameters(), lr=self.args.lr, masks=self.masks)
+        else:
+            raise ValueError(f"Optimizer {self.args.optimizer} not supported")
+
+        self.lr_scheduler = training_utils.get_scheduler(
+            optimizer=self.optimizer,
+            scheduler_type=self.args.scheduler,
+            num_training_steps=self.args.total_training_steps,
+            warmup_steps=self.args.warmup_steps,
+            min_lr_ratio=self.args.min_lr_ratio,
+        )
 
     def step(self):
         """
@@ -336,6 +368,8 @@ class Masking(object):
 
         self.remove_weight_partial_name('bias')
         self.init_sparse_masks()
+        self.setting_optimizer(model=module)
+        self.apply_mask()  # apply masks
         self.masks_pre = {k: v.clone().detach() for k, v in self.masks.items()}
 
     def remove_weight(self, name):
@@ -420,6 +454,16 @@ class Masking(object):
         - gradient: Use gradient information to guide parameter activation (used in RigL method)
         - momentum: Leverage momentum data for intelligent regrowth
         """
+
+        ## evaluate the impact of pruning
+        print(f"Performing evaluation for befor pruning")
+        total_loss, evaluated_on_tokens = self.evaluate_model_core()
+        perplexity = math.exp(total_loss)
+        print(f"Eval for before pruning: "
+              f"eval_loss {total_loss}  "
+              f"perplexity {perplexity}  "
+              f"tokens {evaluated_on_tokens}")
+
         self.gather_statistics()
 
         total_removed = 0
@@ -457,6 +501,16 @@ class Masking(object):
             self.apply_mask()
         elif self.args.reinit == 'original':
             self.reinit_weights_original_distribution()
+
+        ## evaluate the impact of pruning
+        print(f"Performing evaluation for after pruning")
+        total_loss, evaluated_on_tokens = self.evaluate_model_core()
+        perplexity = math.exp(total_loss)
+        print(f"Eval for after pruning: "
+              f"eval_loss {total_loss}  "
+              f"perplexity {perplexity}  "
+              f"tokens {evaluated_on_tokens}")
+
 
         # growing
         if self.growth_mode == 'global_momentum':
@@ -1061,6 +1115,60 @@ class Masking(object):
         # all weights have non-zero values now,
         # but this will be solved when we .apply_mask after growing new connections
 
+    @torch.no_grad()
+    def evaluate_model_core(self):
+        """Evaluate the current model."""
+
+        val_dir = '/scratch-shared/xiaoq/c4_sampling/c4_filtered_validation_10M'
+        val_data = datasets.load_dataset("arrow", data_dir=val_dir, split="validation", streaming=True)
+
+        if not self.args.single_gpu:
+            val_data = datasets.distributed.split_dataset_by_node(val_data, rank=self.global_rank, world_size=self.world_size)
+
+        val_data_mapped = val_data.map(
+            self.preprocess_batched,
+            batched=True,
+            remove_columns=["text"],  # ["text", "timestamp", "url"],
+        )
+        # val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
+        dataloader = torch.utils.data.DataLoader(
+            val_data_mapped,
+            batch_size=self.args.batch_size,
+            collate_fn=default_data_collator,
+        )
+
+        target_eval_tokens = 10_000_000
+        evaluated_on_tokens = 0
+        total_loss = torch.tensor(0.0).to(self.device)
+        total_batches = 1
+
+        # for batch in val_data_mapped.batch(batch_size=batch_size):
+        for batch in dataloader:
+            if evaluated_on_tokens > target_eval_tokens:
+                break
+            total_batches += 1
+
+            # batch = default_data_collator(batch)
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            labels = batch["input_ids"].clone()
+            labels[labels == self.pad_idx] = -100
+
+            # Standard, single model
+            loss = self.modules[0](**batch, labels=labels).loss
+            total_loss += loss.detach()
+
+            evaluated_on_tokens += (batch["input_ids"] != self.pad_idx).sum().item() * self.world_size
+
+        total_loss = total_loss / total_batches
+
+        # Gather losses across all GPUs
+        gathered_losses = [torch.zeros_like(total_loss) for _ in range(self.world_size)]
+        dist.all_gather(gathered_losses, total_loss)
+        total_loss = sum([t.item() for t in gathered_losses]) / self.world_size
+
+        return total_loss, evaluated_on_tokens
+
+
 def weight_init(weight, embedding=False):
     """Initialize weights using the original initialization scheme."""
     if embedding:
@@ -1070,3 +1178,5 @@ def weight_init(weight, embedding=False):
         # std = config.initializer_range
         std = 0.02  # default value
         weight.data.normal_(mean=0.0, std=std)
+
+
