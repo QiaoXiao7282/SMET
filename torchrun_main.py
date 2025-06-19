@@ -88,6 +88,11 @@ def parse_args(args):
     parser.add_argument("--print_grad_norm", type=str2bool, default=True, help="Print gradient norm")
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
 
+    ## optimizer
+    parser.add_argument('--op_decay_steps', type=float, default=20, help='decay steps for the regrow weights.')
+    parser.add_argument('--op_decay_max', type=float, default=1.0, help='decay maximum for the regrow weights.')
+    parser.add_argument('--accumulate_grad_steps', type=float, default=5, help='accumulate gradient steps.')
+    parser.add_argument('--maintain_num', type=float, default=2, help='accumulate gradient number.')
 
     # Sparsity args
     parser.add_argument('--density', type=float, default=1.0, help="The density of the sparse network. This is the final density if using a non-constant --density_decay.")
@@ -95,12 +100,11 @@ def parse_args(args):
     parser.add_argument('--dense_head', type=str2bool, default=True, help='Leave embedding layer dense. Default: False.')
     parser.add_argument('--am_ratio', type=float, default=1.0, help='Attention/mlp ratio. Default: 1.')
 
-
     parser.add_argument('--ddt', action='store_true', default=False, help='Enable dynamic dense training. Default: False.')
     parser.add_argument('--update_frequency', type=int, default=100, metavar='N', help='how many iterations to train between mask update')
     parser.add_argument('--growth', type=str, default='random', help='Growth mode. Choose from: momentum, random, and momentum_neuron.')
     parser.add_argument('--prune', type=str, default='magnitude', help='Pruning mode. Choose from: magnitude, SET, threshold.')
-    parser.add_argument('--reinit', type=str, default='zero', help='Weight reinitialization mode. Choose from: no, zero, original.')
+    parser.add_argument('--reinit', type=str, default='no', help='Weight reinitialization mode. Choose from: no, zero, original.')
     parser.add_argument('--redistribution', type=str, default='none', help='Redistribution mode. Choose from: momentum, magnitude, nonzeros, or none.')
     parser.add_argument('--prune_rate', type=float, default=0.50, help='The pruning rate.')
     parser.add_argument('--prune_rate_decay', type=str, default='cosine', help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
@@ -403,7 +407,7 @@ def main(args):
             optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "adamw":
             optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
-        elif args.optimizer.lower() == "adamDST":
+        elif args.optimizer.lower() == "adamdst":
             optimizer = AdamDST(trainable_params, lr=args.lr)
         else:
             raise ValueError(f"Optimizer {args.optimizer} not supported")
@@ -465,13 +469,13 @@ def main(args):
 
             # Check gradient norm validity, avoid data corruption
             grad_norm = get_grad_norm(trainable_params)
-            if math.isnan(grad_norm) or math.isinf(grad_norm):
-                logger.warning(f"Skipping step {global_step} due to invalid grad_norm = {grad_norm}")
-                if use_sparsity:
-                    mask.optimizer.zero_grad()
-                else:
-                    optimizer.zero_grad()
-                continue
+            # if math.isnan(grad_norm) or math.isinf(grad_norm):
+            #     logger.warning(f"Skipping step {global_step} due to invalid grad_norm = {grad_norm}")
+            #     if use_sparsity:
+            #         mask.optimizer.zero_grad()
+            #     else:
+            #         optimizer.zero_grad()
+            #     continue
 
             # add grad clipping
             if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
@@ -502,7 +506,7 @@ def main(args):
             if not args.no_save:
                 if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
                     if use_sparsity:
-                        save_model(model, mask.optimizer, scheduler, update_step, global_step, run_config,
+                        save_model(model, mask.optimizer, mask.lr_scheduler, update_step, global_step, run_config,
                                    tokens_seen, tokens_seen_before, update_time, args)
 
                     else:
@@ -589,7 +593,7 @@ def main(args):
             )
         logger.info(f"Final eval loss: {total_loss} and perplexity: {perplexity} on tokens: {evaluated_on_tokens}")
 
-    if not args.no_save or True:
+    if not args.no_save and False:
         current_model_directory = f"{args.save_dir}/model_{args.epochs}_{update_step}_seed{args.seed}"
         if global_rank == 0 and not os.path.exists(current_model_directory):
             logger.info(f"Saving model and optimizer to {current_model_directory}, epoch {args.epochs}, update step {update_step}")

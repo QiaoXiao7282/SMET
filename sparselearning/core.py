@@ -8,7 +8,7 @@ from sparselearning.decay import CosineDecay, LinearDecay, ConstantDecay, WSDDec
 from transformers import AutoConfig, AutoTokenizer, default_data_collator
 import torch.distributed as dist
 from peft_pretraining import training_utils, args_utils
-from sparselearning.optimizer import AdamDST
+from sparselearning.optimizer import AdamDST, SftAdamW
 
 import datasets
 
@@ -61,6 +61,7 @@ class Masking(object):
         self.growth_funcs['momentum_neuron'] = self.momentum_neuron_growth
 
         self.masks = {}
+        self.masks_pre_pre = {}
         self.final_masks = {}
         self.grads = {}
         self.scores = {}
@@ -79,6 +80,7 @@ class Masking(object):
 
 
         # stats
+        self.momentum_dict = {}
         self.name2variance = {}
         self.name2zeros = {}
         self.name2nonzeros = {}
@@ -285,7 +287,7 @@ class Masking(object):
         elif self.args.optimizer.lower() == "adamw":
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.args.lr)
         elif self.args.optimizer.lower() == "adamdst":
-            self.optimizer = AdamDST(model.parameters(), lr=self.args.lr, masks=self.masks)
+            self.optimizer = SftAdamW(model.named_parameters(), lr=self.args.lr, masks=self.masks, masks_pre=self.masks_pre_pre, decay_steps=self.args.op_decay_steps, decay_max=self.args.op_decay_max)
         else:
             raise ValueError(f"Optimizer {self.args.optimizer} not supported")
 
@@ -328,11 +330,21 @@ class Masking(object):
         self.steps += 1
 
         if self.prune_every_k_steps is not None:
+
             if self.steps % self.prune_every_k_steps == 0:
                 self.set_new_layer_densities()
+                self.masks_pre_pre = {k: v.clone().detach() for k, v in self.masks.items()}
+
                 self.truncate_weights()
                 self.print_nonzero_counts()
                 self.masks_pre = {k: v.clone().detach() for k, v in self.masks.items()}
+
+                ## update masks in optimizer
+                if self.args.optimizer.lower() == "adamdst":
+                    self.optimizer.masks = self.masks
+                    self.optimizer.masks_pre = self.masks_pre_pre
+
+                self.momentum_dict = {}
 
                 ## check overall density
                 total_size = 0
@@ -345,6 +357,38 @@ class Masking(object):
                     sparse_size += (weight != 0).sum().int().item()
 
                 print('Total parameters under sparsity level of {0}'.format(sparse_size / total_size))
+
+            if self.steps % self.prune_every_k_steps > (self.prune_every_k_steps - self.args.accumulate_grad_steps):
+                for module in self.modules:
+                    for name, tensor in module.named_parameters():
+                        if name not in self.masks:
+                            continue
+
+                        grad_flat = tensor.grad.detach().abs().view(-1)
+                        mask_flat = self.masks[name].view(-1)
+
+                        if name not in self.momentum_dict:
+                            maintain_num = int(self.args.maintain_num * self.name2nonzeros[name] * self.name2prune_rate[name])
+                            if maintain_num == 0:
+                                continue
+
+                            inactive_mask = (mask_flat == 0)
+                            inactive_grad = grad_flat * inactive_mask
+                            topk_values, topk_indices = torch.topk(inactive_grad, maintain_num)
+
+                            self.momentum_dict[name] = {
+                                "values": topk_values.clone(),  # |g|
+                                "values_sq": topk_values.pow(2).clone(),  # g^2
+                                "indices": topk_indices.clone()
+                            }
+
+                        else:
+                            indices = self.momentum_dict[name]["indices"]
+                            selected_grad = grad_flat[indices]
+
+                            self.momentum_dict[name]["values"] += selected_grad.abs()
+                            self.momentum_dict[name]["values_sq"] += selected_grad.pow(2)
+
 
     def add_module(self, module, density, sparse_init='ER'):
         self.sparse_init = sparse_init
@@ -370,6 +414,7 @@ class Masking(object):
         self.init_sparse_masks()
         self.setting_optimizer(model=module)
         self.apply_mask()  # apply masks
+        self.gather_statistics()
         self.masks_pre = {k: v.clone().detach() for k, v in self.masks.items()}
 
     def remove_weight(self, name):
@@ -455,14 +500,14 @@ class Masking(object):
         - momentum: Leverage momentum data for intelligent regrowth
         """
 
-        ## evaluate the impact of pruning
-        print(f"Performing evaluation for befor pruning")
-        total_loss, evaluated_on_tokens = self.evaluate_model_core()
-        perplexity = math.exp(total_loss)
-        print(f"Eval for before pruning: "
-              f"eval_loss {total_loss}  "
-              f"perplexity {perplexity}  "
-              f"tokens {evaluated_on_tokens}")
+        # ## evaluate the impact of pruning
+        # print(f"Performing evaluation for befor pruning")
+        # total_loss, evaluated_on_tokens = self.evaluate_model_core()
+        # perplexity = math.exp(total_loss)
+        # print(f"Eval for before pruning: "
+        #       f"eval_loss {total_loss}  "
+        #       f"perplexity {perplexity}  "
+        #       f"tokens {evaluated_on_tokens}")
 
         self.gather_statistics()
 
@@ -502,14 +547,14 @@ class Masking(object):
         elif self.args.reinit == 'original':
             self.reinit_weights_original_distribution()
 
-        ## evaluate the impact of pruning
-        print(f"Performing evaluation for after pruning")
-        total_loss, evaluated_on_tokens = self.evaluate_model_core()
-        perplexity = math.exp(total_loss)
-        print(f"Eval for after pruning: "
-              f"eval_loss {total_loss}  "
-              f"perplexity {perplexity}  "
-              f"tokens {evaluated_on_tokens}")
+        # ## evaluate the impact of pruning
+        # print(f"Performing evaluation for after pruning")
+        # total_loss, evaluated_on_tokens = self.evaluate_model_core()
+        # perplexity = math.exp(total_loss)
+        # print(f"Eval for after pruning: "
+        #       f"eval_loss {total_loss}  "
+        #       f"perplexity {perplexity}  "
+        #       f"tokens {evaluated_on_tokens}")
 
 
         # growing
@@ -536,6 +581,35 @@ class Masking(object):
 
                     elif self.growth_mode == 'gradient':  # RigL
                         new_mask, grad = self.gradient_growth(name, new_mask, total_regrowth, weight)
+
+                    elif self.growth_mode == 'gradient_acc':  # RigL_acc
+
+                        new_mask, regrow_idx, topk_pos = self.gradient_growth_acc(name, new_mask, total_regrowth, weight)
+
+                        if self.args.optimizer.lower() == "adamdst":
+                            all_values = self.momentum_dict[name]["values"]  # shape: [N]
+                            all_values_sq = self.momentum_dict[name]["values_sq"]
+
+                            beta1, beta2 = self.optimizer.defaults["betas"]
+                            acc_steps = self.args.accumulate_grad_steps
+
+                            # get matched positions in all_indices
+                            selected_grads = all_values[topk_pos] / acc_steps
+                            selected_grads_sq = all_values_sq[topk_pos] / acc_steps
+
+                            # acc_steps = acc_steps.to(dtype=torch.float32)
+                            selected_grads *= (1.0 - beta1 ** acc_steps)
+                            selected_grads_sq *= (1.0 - beta2 ** acc_steps)
+
+                            self.update_optimizer_momenta_for_regrowth(
+                                param=weight,
+                                regrow_indices=regrow_idx,
+                                init_momenta={
+                                    "step": acc_steps,
+                                    "exp_avg": selected_grads,
+                                    "exp_avg_sq": selected_grads_sq,
+                                }
+                            )
 
                     elif self.growth_mode == 'momentum_neuron':
                         new_mask = self.momentum_neuron_growth(name, new_mask, total_regrowth, weight)
@@ -866,6 +940,28 @@ class Masking(object):
 
         return new_mask, grad
 
+
+    def gradient_growth_acc(self, name, new_mask, total_regrowth, weight):
+        """
+        Regrow connections based on accumulated gradient scores in self.momentum_dict.
+        """
+        if name not in self.momentum_dict:
+            raise ValueError(f"Missing momentum entry for {name} during regrowth.")
+
+        score = self.momentum_dict[name]["values"]
+        indices = self.momentum_dict[name]["indices"]
+
+        topk_vals, topk_pos = torch.topk(score, total_regrowth)  # topk_pos: positions in `score`
+
+        # Map back to global positions using `indices`
+        regrow_idx = indices[topk_pos]  # these are flat positions in full weight
+
+        # Update new_mask
+        flat_mask = new_mask.view(-1)
+        flat_mask[regrow_idx] = 1.0
+
+        return new_mask, regrow_idx, topk_pos
+
     def mix_growth(self, name, new_mask, total_regrowth, weight):
         gradient_grow = int(total_regrowth * self.args.mix)
         random_grow = total_regrowth - gradient_grow
@@ -1167,6 +1263,29 @@ class Masking(object):
         total_loss = sum([t.item() for t in gathered_losses]) / self.world_size
 
         return total_loss, evaluated_on_tokens
+
+    def update_optimizer_momenta_for_regrowth(self, param, regrow_indices, init_momenta={}):
+        if init_momenta is None:
+            init_momenta = {}
+
+        optimizer_state = self.optimizer.state[param]
+
+        for key in ['exp_avg', 'exp_avg_sq', 'step']:
+
+            if key not in optimizer_state:
+                continue
+
+            optimizer_params = optimizer_state[key]
+            init = init_momenta.get(key, None)
+
+            if init is not None:
+                if isinstance(init, torch.Tensor):
+                    init = init.to(dtype=optimizer_params.dtype)
+
+                optimizer_params.view(-1)[regrow_indices] = init
+            else:
+                optimizer_params.view(-1)[regrow_indices] = 0.0
+
 
 
 def weight_init(weight, embedding=False):
