@@ -17,7 +17,7 @@ import wandb
 from tqdm import tqdm
 from loguru import logger
 from datasets import load_from_disk
-from sparselearning.optimizer import AdamDST
+# from sparselearning.optimizer import AdamDST
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset

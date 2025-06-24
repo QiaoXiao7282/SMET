@@ -8,7 +8,8 @@ from sparselearning.decay import CosineDecay, LinearDecay, ConstantDecay, WSDDec
 from transformers import AutoConfig, AutoTokenizer, default_data_collator
 import torch.distributed as dist
 from peft_pretraining import training_utils, args_utils
-from sparselearning.optimizer import AdamDST, SftAdamW
+# from sparselearning.optimizer import AdamDST, SftAdamW
+from sparselearning.optimizer_new import Adam
 
 import datasets
 
@@ -287,7 +288,8 @@ class Masking(object):
         elif self.args.optimizer.lower() == "adamw":
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.args.lr)
         elif self.args.optimizer.lower() == "adamdst":
-            self.optimizer = SftAdamW(model.named_parameters(), lr=self.args.lr, masks=self.masks, masks_pre=self.masks_pre_pre, decay_steps=self.args.op_decay_steps, decay_max=self.args.op_decay_max)
+            # self.optimizer = SftAdamW(model.named_parameters(), lr=self.args.lr, masks=self.masks, masks_pre=self.masks_pre_pre, decay_steps=self.args.op_decay_steps, decay_max=self.args.op_decay_max)
+            self.optimizer = Adam(model.named_parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay, masks=self.masks, masks_pre=self.masks_pre_pre, decay_steps=self.args.op_decay_steps, decay_max=self.args.op_decay_max)
         else:
             raise ValueError(f"Optimizer {self.args.optimizer} not supported")
 
@@ -358,7 +360,7 @@ class Masking(object):
 
                 print('Total parameters under sparsity level of {0}'.format(sparse_size / total_size))
 
-            if self.steps % self.prune_every_k_steps > (self.prune_every_k_steps - self.args.accumulate_grad_steps):
+            if (self.steps % self.prune_every_k_steps > (self.prune_every_k_steps - self.args.accumulate_grad_steps)) and self.growth_mode == 'gradient_acc':
                 for module in self.modules:
                     for name, tensor in module.named_parameters():
                         if name not in self.masks:
@@ -374,7 +376,9 @@ class Masking(object):
 
                             inactive_mask = (mask_flat == 0)
                             inactive_grad = grad_flat * inactive_mask
-                            topk_values, topk_indices = torch.topk(inactive_grad, maintain_num)
+                            sorted_vals, sorted_indices = torch.sort(inactive_grad, descending=True)
+                            topk_values = sorted_vals[:maintain_num]
+                            topk_indices = sorted_indices[:maintain_num]
 
                             self.momentum_dict[name] = {
                                 "values": topk_values.clone(),  # |g|
@@ -574,13 +578,35 @@ class Masking(object):
 
                     # growth
                     if self.growth_mode == 'random':
-                        new_mask = self.random_growth(name, new_mask, total_regrowth, weight)
+                        new_mask, regrow_idx = self.random_growth(name, new_mask, total_regrowth, weight)
+
+                        if self.args.optimizer.lower() == "adamdst" and regrow_idx.numel() > 0:
+                            acc_steps = self.args.accumulate_grad_steps
+
+                            self.update_optimizer_momenta_for_regrowth(
+                                param=weight,
+                                regrow_indices=regrow_idx,
+                                init_momenta={
+                                    "step": acc_steps,
+                                }
+                            )
 
                     elif self.growth_mode == 'momentum':
                         new_mask = self.momentum_growth(name, new_mask, total_regrowth, weight)
 
                     elif self.growth_mode == 'gradient':  # RigL
-                        new_mask, grad = self.gradient_growth(name, new_mask, total_regrowth, weight)
+                        new_mask, regrow_idx = self.gradient_growth(name, new_mask, total_regrowth, weight)
+
+                        if self.args.optimizer.lower() == "adamdst" and regrow_idx.numel() > 0:
+                            acc_steps = self.args.accumulate_grad_steps
+
+                            self.update_optimizer_momenta_for_regrowth(
+                                param=weight,
+                                regrow_indices=regrow_idx,
+                                init_momenta={
+                                    "step": acc_steps,
+                                }
+                            )
 
                     elif self.growth_mode == 'gradient_acc':  # RigL_acc
 
@@ -892,7 +918,7 @@ class Masking(object):
                     GROWTH
     '''
 
-    def random_growth(self, name, new_mask, total_regrowth, weight):
+    def random_growth_ori(self, name, new_mask, total_regrowth, weight):
         """
         This function implements the random growth strategy for sparse neural networks,
         which is used in algorithms like SET. It randomly
@@ -908,6 +934,32 @@ class Masking(object):
         if (new_mask_!=0).sum().item() == 0:
             new_mask_ = new_mask
         return new_mask_
+
+    def random_growth(self, name, new_mask, total_regrowth, weight):
+        """
+        Randomly regrow connections at zero-valued positions in the mask.
+
+        Returns:
+            new_mask: Updated binary mask after regrowth.
+            regrow_idx: Flattened indices of newly regrown connections.
+        """
+        flat_mask = new_mask.view(-1)
+        zero_indices = (flat_mask == 0).nonzero(as_tuple=False).view(-1)
+
+        num_candidates = zero_indices.numel()
+        if num_candidates == 0 or total_regrowth == 0:
+            return new_mask, torch.tensor([], dtype=torch.long, device=flat_mask.device)
+
+        total_regrowth = min(total_regrowth, num_candidates)
+
+        # 随机选出 regrow 的位置
+        rand_idx = torch.randperm(num_candidates, device=flat_mask.device)[:total_regrowth]
+        regrow_idx = zero_indices[rand_idx]
+
+        # 更新 mask
+        flat_mask[regrow_idx] = 1.0
+
+        return new_mask, regrow_idx
 
     def momentum_growth(self, name, new_mask, total_regrowth, weight):
         grad = self.get_momentum_for_weight(weight)
@@ -936,9 +988,10 @@ class Masking(object):
         grad = grad*(new_mask==0).float()
 
         y, idx = torch.sort(torch.abs(grad).flatten(), descending=True)
-        new_mask.data.view(-1)[idx[:total_regrowth]] = 1.0
+        regrow_idx = idx[:total_regrowth]
+        new_mask.data.view(-1)[regrow_idx] = 1.0
 
-        return new_mask, grad
+        return new_mask, regrow_idx
 
 
     def gradient_growth_acc(self, name, new_mask, total_regrowth, weight):
@@ -951,14 +1004,13 @@ class Masking(object):
         score = self.momentum_dict[name]["values"]
         indices = self.momentum_dict[name]["indices"]
 
-        topk_vals, topk_pos = torch.topk(score, total_regrowth)  # topk_pos: positions in `score`
+        sorted_vals, sorted_pos = torch.sort(score, descending=True)
 
-        # Map back to global positions using `indices`
-        regrow_idx = indices[topk_pos]  # these are flat positions in full weight
+        topk_pos = sorted_pos[:total_regrowth]
+        regrow_idx = indices[topk_pos]
 
         # Update new_mask
-        flat_mask = new_mask.view(-1)
-        flat_mask[regrow_idx] = 1.0
+        new_mask.data.view(-1)[regrow_idx] = 1.0
 
         return new_mask, regrow_idx, topk_pos
 
@@ -1270,7 +1322,7 @@ class Masking(object):
 
         optimizer_state = self.optimizer.state[param]
 
-        for key in ['exp_avg', 'exp_avg_sq', 'step']:
+        for key in ['step']:  ## 'exp_avg', 'exp_avg_sq',
 
             if key not in optimizer_state:
                 continue
