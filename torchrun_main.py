@@ -45,6 +45,7 @@ def parse_args(args):
 
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--val_dir", type=str, default=None)
     parser.add_argument("--continue_from", type=str, default=None)
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
@@ -178,8 +179,8 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     # val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True)
     # val_data = val_data.shuffle(seed=42)
 
-    val_dir = '/scratch-shared/xiaoq/c4_sampling/c4_filtered_validation_10M'
-    val_data = datasets.load_dataset("arrow", data_dir=val_dir, split="validation", streaming=True)
+    # val_dir = '/scratch-shared/xiaoq/c4_sampling/c4_filtered_validation_10M'
+    val_data = datasets.load_dataset("arrow", data_dir=args.val_dir, split="validation", streaming=True)
 
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -407,8 +408,6 @@ def main(args):
             optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "adamw":
             optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
-        elif args.optimizer.lower() == "adamdst":
-            optimizer = AdamDST(trainable_params, lr=args.lr)
         else:
             raise ValueError(f"Optimizer {args.optimizer} not supported")
 

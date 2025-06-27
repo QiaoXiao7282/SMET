@@ -69,6 +69,7 @@ run_name="${size}_s${seed}"
 max_length=256
 total_batch_size=512
 
+val_dir='/scratch-shared/xiaoq/c4_sampling/c4_filtered_validation_10M'
 data_dir="/scratch-shared/xiaoq/c4_sampling/c4_filtered_maxlength${max_length}_bs${total_batch_size}_step${training_steps}_arrow_shuffle32"
 #data_dir=None
 
@@ -92,6 +93,7 @@ python -m torch.distributed.launch \
     --model_config "configs/llama_${size}.json" \
     --density $density \
     --data_dir ${data_dir} \
+    --val_dir ${val_dir} \
     --update_frequency $update_freq \
     --growth ${growth} \
     --prune $prune \

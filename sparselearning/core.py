@@ -333,6 +333,41 @@ class Masking(object):
 
         if self.prune_every_k_steps is not None:
 
+
+            if ((self.steps-1) % self.prune_every_k_steps >= (self.prune_every_k_steps - self.args.accumulate_grad_steps)) and self.growth_mode == 'gradient_acc':
+                for module in self.modules:
+                    for name, tensor in module.named_parameters():
+                        if name not in self.masks:
+                            continue
+
+                        grad_flat = tensor.grad.clone().abs().view(-1)
+                        mask_flat = self.masks[name].view(-1)
+
+                        if name not in self.momentum_dict:
+                            maintain_num = int(self.args.maintain_num * self.name2nonzeros[name] * self.name2prune_rate[name])
+                            if maintain_num == 0:
+                                continue
+
+                            inactive_mask = (mask_flat == 0)
+                            inactive_grad = grad_flat * inactive_mask
+                            sorted_vals, sorted_indices = torch.sort(inactive_grad, descending=True)
+                            topk_values = sorted_vals[:maintain_num]
+                            topk_indices = sorted_indices[:maintain_num]
+
+                            self.momentum_dict[name] = {
+                                "values": topk_values.clone(),  # |g|
+                                "values_sq": topk_values.pow(2).clone(),  # g^2
+                                "indices": topk_indices.clone()
+                            }
+
+                        else:
+                            indices = self.momentum_dict[name]["indices"]
+                            selected_grad = grad_flat[indices]
+
+                            self.momentum_dict[name]["values"] += selected_grad.abs()
+                            self.momentum_dict[name]["values_sq"] += selected_grad.pow(2)
+
+
             if self.steps % self.prune_every_k_steps == 0:
                 self.set_new_layer_densities()
                 self.masks_pre_pre = {k: v.clone().detach() for k, v in self.masks.items()}
@@ -360,38 +395,6 @@ class Masking(object):
 
                 print('Total parameters under sparsity level of {0}'.format(sparse_size / total_size))
 
-            if (self.steps % self.prune_every_k_steps > (self.prune_every_k_steps - self.args.accumulate_grad_steps)) and self.growth_mode == 'gradient_acc':
-                for module in self.modules:
-                    for name, tensor in module.named_parameters():
-                        if name not in self.masks:
-                            continue
-
-                        grad_flat = tensor.grad.detach().abs().view(-1)
-                        mask_flat = self.masks[name].view(-1)
-
-                        if name not in self.momentum_dict:
-                            maintain_num = int(self.args.maintain_num * self.name2nonzeros[name] * self.name2prune_rate[name])
-                            if maintain_num == 0:
-                                continue
-
-                            inactive_mask = (mask_flat == 0)
-                            inactive_grad = grad_flat * inactive_mask
-                            sorted_vals, sorted_indices = torch.sort(inactive_grad, descending=True)
-                            topk_values = sorted_vals[:maintain_num]
-                            topk_indices = sorted_indices[:maintain_num]
-
-                            self.momentum_dict[name] = {
-                                "values": topk_values.clone(),  # |g|
-                                "values_sq": topk_values.pow(2).clone(),  # g^2
-                                "indices": topk_indices.clone()
-                            }
-
-                        else:
-                            indices = self.momentum_dict[name]["indices"]
-                            selected_grad = grad_flat[indices]
-
-                            self.momentum_dict[name]["values"] += selected_grad.abs()
-                            self.momentum_dict[name]["values_sq"] += selected_grad.pow(2)
 
 
     def add_module(self, module, density, sparse_init='ER'):
@@ -632,8 +635,8 @@ class Masking(object):
                                 regrow_indices=regrow_idx,
                                 init_momenta={
                                     "step": acc_steps,
-                                    "exp_avg": selected_grads,
-                                    "exp_avg_sq": selected_grads_sq,
+                                    # "exp_avg": selected_grads,
+                                    # "exp_avg_sq": selected_grads_sq,
                                 }
                             )
 
