@@ -17,13 +17,15 @@ import wandb
 from tqdm import tqdm
 from loguru import logger
 from datasets import load_from_disk
-# from sparselearning.optimizer import AdamDST
+from sparselearning.optimizer_new import Adam
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
-from sparselearning.core import Masking
+from sparselearning.core_index import Masking
+
 transformers.logging.set_verbosity_error()
+
 
 def str2bool(v):
     """
@@ -39,6 +41,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
 def parse_args(args):
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
@@ -53,6 +56,8 @@ def parse_args(args):
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--optimizer", default="Adam")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--activation_checkpointing", type=str2bool, default=False, help="")
@@ -85,38 +90,75 @@ def parse_args(args):
 
     parser.add_argument('--wandb_used', type=str2bool, default=False, help="Use wandb or not")
     parser.add_argument('--wandb_mode', type=str, default="disabled", choices=["online", "offline", "disabled"])
-    parser.add_argument("--tags", type=str, default=None, help="Comma separated list of tags for wandb. Example: 'tag1,tag2' ")
+    parser.add_argument("--tags", type=str, default=None,
+                        help="Comma separated list of tags for wandb. Example: 'tag1,tag2' ")
     parser.add_argument("--print_grad_norm", type=str2bool, default=True, help="Print gradient norm")
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
 
     ## optimizer
-    parser.add_argument('--op_decay_steps', type=float, default=20, help='decay steps for the regrow weights.')
+    parser.add_argument("--init_sparse", type=str2bool, default=False, help="")
+    parser.add_argument('--op_decay_steps', type=int, default=1, help='decay steps for the regrow weights.')
     parser.add_argument('--op_decay_max', type=float, default=1.0, help='decay maximum for the regrow weights.')
     parser.add_argument('--accumulate_grad_steps', type=float, default=5, help='accumulate gradient steps.')
     parser.add_argument('--maintain_num', type=float, default=2, help='accumulate gradient number.')
+    parser.add_argument("--use_norm_adjust", type=str2bool, default=False, help="")
+    parser.add_argument("--use_density_scale", type=str2bool, default=False, help="")
+
+    parser.add_argument("--mup_enabled", type=str2bool, default=False, help="")
+    parser.add_argument('--mup_width_multiplier', type=float, default=2, help='accumulate gradient number.')
+    parser.add_argument('--mup_input_alpha', type=float, default=5, help='accumulate gradient number.')
+    parser.add_argument('--mup_output_alpha', type=float, default=1, help='accumulate gradient number.')
+
+    ## resume
+    parser.add_argument("--resume", type=str2bool, default=False, help="")
+    parser.add_argument("--save_step", type=int, default=1000)
+    parser.add_argument("--output_dir", type=str, default=None)
 
     # Sparsity args
-    parser.add_argument('--density', type=float, default=1.0, help="The density of the sparse network. This is the final density if using a non-constant --density_decay.")
-    parser.add_argument('--dense_embedding', type=str2bool, default=True, help='Leave embedding layer dense. Default: False.')
-    parser.add_argument('--dense_head', type=str2bool, default=True, help='Leave embedding layer dense. Default: False.')
+    parser.add_argument('--density', type=float, default=1.0,
+                        help="The density of the sparse network. This is the final density if using a non-constant --density_decay.")
+    parser.add_argument('--dense_embedding', type=str2bool, default=True,
+                        help='Leave embedding layer dense. Default: False.')
+    parser.add_argument('--dense_head', type=str2bool, default=True,
+                        help='Leave embedding layer dense. Default: False.')
     parser.add_argument('--am_ratio', type=float, default=1.0, help='Attention/mlp ratio. Default: 1.')
+    parser.add_argument('--alpha_u', type=float, default=0.5, help='u shape ratio. Default: 0.5')
 
-    parser.add_argument('--ddt', action='store_true', default=False, help='Enable dynamic dense training. Default: False.')
-    parser.add_argument('--update_frequency', type=int, default=100, metavar='N', help='how many iterations to train between mask update')
-    parser.add_argument('--growth', type=str, default='random', help='Growth mode. Choose from: momentum, random, and momentum_neuron.')
-    parser.add_argument('--prune', type=str, default='magnitude', help='Pruning mode. Choose from: magnitude, SET, threshold.')
-    parser.add_argument('--reinit', type=str, default='no', help='Weight reinitialization mode. Choose from: no, zero, original.')
-    parser.add_argument('--redistribution', type=str, default='none', help='Redistribution mode. Choose from: momentum, magnitude, nonzeros, or none.')
+    parser.add_argument('--ddt', action='store_true', default=False,
+                        help='Enable dynamic dense training. Default: False.')
+    parser.add_argument('--update_frequency', type=int, default=100, metavar='N',
+                        help='how many iterations to train between mask update')
+    parser.add_argument('--growth', type=str, default='random',
+                        help='Growth mode. Choose from: momentum, random, and momentum_neuron.')
+    parser.add_argument('--prune', type=str, default='magnitude',
+                        help='Pruning mode. Choose from: magnitude, SET, threshold.')
+    parser.add_argument('--reinit', type=str, default='no',
+                        help='Weight reinitialization mode. Choose from: no, zero, original.')
+    parser.add_argument('--redistribution', type=str, default='none',
+                        help='Redistribution mode. Choose from: momentum, magnitude, nonzeros, or none.')
     parser.add_argument('--prune_rate', type=float, default=0.50, help='The pruning rate.')
-    parser.add_argument('--prune_rate_decay', type=str, default='cosine', help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
-    parser.add_argument('--density_decay', type=str, default='constant', help='The decay schedule for the density. If not constant, will start training with density=1 and decay to --density. Default: constant. Choose from: constant, linear, cosine.')
-    parser.add_argument('--initial_density', type=float, default=0.999, help='The initial density for the density decay schedule. Only used when density_decay!=constant. Default: 0.999.')
+    parser.add_argument('--prune_rate_decay', type=str, default='cosine',
+                        help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
+    parser.add_argument('--density_decay', type=str, default='constant',
+                        help='The decay schedule for the density. If not constant, will start training with density=1 and decay to --density. Default: constant. Choose from: constant, linear, cosine.')
+    parser.add_argument('--initial_density', type=float, default=0.999,
+                        help='The initial density for the density decay schedule. Only used when density_decay!=constant. Default: 0.999.')
     parser.add_argument('--fix', type=str2bool, default=False, help='Fix topology during training. Default: False.')
     parser.add_argument('--sparse_init', type=str, default='Multi_Output', help='sparse initialization')
     parser.add_argument('--mix', type=float, default=0.0)
-    parser.add_argument('--temperature_decay', type=str, default='constant', help='The decay schedule for the temperature. Choose from: constant, linear.')
-    parser.add_argument('--temperature', type=float, default=3, help='The temperature for soft sampling of pruning. (This is the final temperature if using a non-constant --temperature_decay.)')
-    parser.add_argument('--init_temperature', type=float, default=1, help='The initial temperature for the temperature decay schedule. Only used when --temperature_decay != constant.')
+    parser.add_argument('--temperature_decay', type=str, default='constant',
+                        help='The decay schedule for the temperature. Choose from: constant, linear.')
+    parser.add_argument('--temperature', type=float, default=3,
+                        help='The temperature for soft sampling of pruning. (This is the final temperature if using a non-constant --temperature_decay.)')
+    parser.add_argument('--init_temperature', type=float, default=1,
+                        help='The initial temperature for the temperature decay schedule. Only used when --temperature_decay != constant.')
+
+    parser.add_argument('--blocksize', type=int, default=4)
+    parser.add_argument("--lr_scale", type=str2bool, default=False, help="")
+    parser.add_argument("--reset_steps", type=str2bool, default=True, help="")
+    parser.add_argument("--mask_momentum", type=str2bool, default=True, help="")
+
+    parser.add_argument("--compare_update", type=str2bool, default=False, help="")
 
     args = parser.parse_args(args)
     args = args_utils.check_args_torchrun_main(args)
@@ -175,12 +217,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
         if "lm_head" in name:
             logger.info(f"Parameter {name} has dtype {param.dtype}")
 
-    # val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True, trust_remote_code=True) #DGX
-    # val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True)
-    # val_data = val_data.shuffle(seed=42)
-
-    # val_dir = '/scratch-shared/xiaoq/c4_sampling/c4_filtered_validation_10M'
-    val_data = datasets.load_dataset("arrow", data_dir=args.val_dir, split="validation", streaming=True)
+    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True, trust_remote_code=True) #DGX
 
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -190,7 +227,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     val_data_mapped = val_data.map(
         preprocess_batched,
         batched=True,
-        remove_columns= ["text"],  #["text", "timestamp", "url"],
+        remove_columns=["text"],  # ["text", "timestamp", "url"],
     )
     # val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
     dataloader = torch.utils.data.DataLoader(
@@ -245,20 +282,14 @@ def get_grad_norm(parameters, norm_type=2):
     )
     return total_norm.item()
 
-def build_dataloader(args, global_rank, world_size, tokenizer, epoch):
 
+def build_dataloader(args, global_rank, world_size, tokenizer, epoch=1):
     logger.info(f"Loading streaming dataset from: {args.data_dir}")
 
-    if args.data_dir is None:
-        dataset = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
-        seed_for_shuffle = 32
-        logger.info(f"Shuffling data with seed {seed_for_shuffle}")
-        dataset: datasets.Dataset = dataset.shuffle(seed=seed_for_shuffle)
-    else:
-        dataset = datasets.load_dataset("arrow", data_dir=args.data_dir, split="train", streaming=True)
-
-        logger.info(f"Shuffling streaming dataset with seed = {epoch}")
-        dataset = dataset.shuffle(seed=epoch)
+    dataset = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True, trust_remote_code=True)
+    seed_for_shuffle = 32
+    logger.info(f"Shuffling data with seed {seed_for_shuffle}")
+    dataset: datasets.Dataset = dataset.shuffle(seed=seed_for_shuffle)
 
     # Apply DDP sharding
     if not args.single_gpu:
@@ -291,6 +322,9 @@ def main(args):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)  # For multi-GPU
+
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -317,7 +351,7 @@ def main(args):
 
     # turn off logger
     if global_rank != 0: logger.remove()
-            
+
     # initialize wandb without config (it is passed later)
     if global_rank == 0 and args.wandb_used:
         wandb.init(project="dst_llms", name=args.run_name, mode=args.wandb_mode, tags=args.tags)
@@ -345,6 +379,13 @@ def main(args):
         return batch
 
     model_config = AutoConfig.from_pretrained(args.model_config)
+    model_config.density = args.density
+    model_config.init_sparse = args.init_sparse
+
+    model_config.mup_enabled = args.mup_enabled
+    model_config.mup_width_multiplier = args.mup_width_multiplier
+    model_config.mup_input_alpha = args.mup_input_alpha
+    model_config.mup_output_alpha = args.mup_output_alpha
 
     model = LlamaForCausalLM(model_config)
 
@@ -377,12 +418,14 @@ def main(args):
         "device": str(device),
     })
 
-    args.total_training_steps = int(args.epochs * args.num_training_steps)
+    args.total_training_steps = int(args.num_training_steps)
+
+    args.warmup_steps = int(0.05 * args.total_training_steps)
 
     if global_rank == 0:
         if args.wandb_used:
             wandb.config.update(run_config, allow_val_change=True)
-            wandb.save(os.path.abspath(__file__), policy="now") # save current script
+            wandb.save(os.path.abspath(__file__), policy="now")  # save current script
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
         pbar = tqdm(total=args.total_training_steps - local_step, desc="Update steps", ncols=80)
@@ -393,8 +436,6 @@ def main(args):
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
     if not args.no_save:
         logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
-    
-
 
     mask = None
     use_sparsity = not args.density == 1
@@ -407,7 +448,13 @@ def main(args):
         if args.optimizer.lower() == "adam":
             optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "adamw":
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
+                                          betas=(args.beta1, args.beta2))
+
+        elif args.optimizer.lower() == "adamdst":
+            optimizer = Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
+                             betas=(args.beta1, args.beta2))
+
         else:
             raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -418,6 +465,28 @@ def main(args):
             warmup_steps=args.warmup_steps,
             min_lr_ratio=args.min_lr_ratio,
         )
+
+    ## if resume
+    if args.resume:
+        checkpoint_paths = args.output_dir + '/checkpoint_latest.pth'
+        checkpoint = torch.load(checkpoint_paths, map_location=torch.device("cuda:{}".format(global_rank)))
+        model.load_state_dict(checkpoint['model'])
+        if use_sparsity:
+            mask.resume(checkpoint, args.density)
+
+        else:
+            if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                scheduler.load_state_dict(checkpoint['scheduler'])
+
+        start_step = checkpoint['save_step']
+        start_step_global = checkpoint['global_step']
+
+        perplexity_save = checkpoint['perplexity']
+
+        pbar = tqdm(total=args.total_training_steps, initial=start_step, desc="Update steps", ncols=80)
+
+        logger.info(f"start_step_global: {start_step_global} / start_step: {start_step}")
 
     if not args.single_gpu:
         model: LlamaForCausalLM = torch.nn.parallel.DistributedDataParallel(
@@ -430,142 +499,192 @@ def main(args):
     setup_time = time.time() - start_script_time
     print(f'Time to setup: {setup_time}')
 
+    ## if resume, then eval
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: running evaluation before continuing training.")
+        total_loss, evaluated_on_tokens = evaluate_model(
+            model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+        )
+        perplexity = math.exp(total_loss)
+
+        logger.info(f"Perplexity (current / previous): {perplexity:.4f} / {perplexity_save:.4f}")
+
     ###############################
     # TRAINING LOOP
-    # implement epochs !!!
     ###############################
-    for epoch in range(args.epochs):
 
-        update_step = 0
-        logger.info(f"=== Starting Epoch {epoch + 1} ===")
-        dataloader = build_dataloader(args, global_rank, world_size, tokenizer, epoch)
+    update_step = 0
+    logger.info(f"=== Starting ===")
+    dataloader = build_dataloader(args, global_rank, world_size, tokenizer)
 
-        for batch_idx, batch in enumerate(dataloader):
+    for batch_idx, batch in enumerate(dataloader):
 
-            global_step += 1
+        global_step += 1
 
-            if update_step > args.num_training_steps:
-                logger.info(f"Reached max number of update steps within epoch (f{args.num_training_steps}). Stopping training.")
-                print(f"Rank {global_rank} stopping training.")
-                break
+        if update_step > args.num_training_steps:
+            logger.info(
+                f"Reached max number of update steps within epoch (f{args.num_training_steps}). Stopping training.")
+            print(f"Rank {global_rank} stopping training.")
+            break
 
-            batch = {k: v.to(device) for k, v in batch.items()}
-
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
-            tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
-
-            # Standard, single model
-            loss = model(**batch, labels=labels).loss
-            scaled_loss = loss / args.gradient_accumulation
-            scaled_loss.backward()
-
-
-            if global_step % args.gradient_accumulation != 0:
-                continue
-
-            # The below code is only executed during the update step, after a full gradient accumulation
-
-            # Check gradient norm validity, avoid data corruption
-            grad_norm = get_grad_norm(trainable_params)
-            # if math.isnan(grad_norm) or math.isinf(grad_norm):
-            #     logger.warning(f"Skipping step {global_step} due to invalid grad_norm = {grad_norm}")
-            #     if use_sparsity:
-            #         mask.optimizer.zero_grad()
-            #     else:
-            #         optimizer.zero_grad()
-            #     continue
-
-            # add grad clipping
-            if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
-
-            ## check loss; global gradient norm !!!
-            if args.print_grad_norm:
-                # grad_norm = get_grad_norm(trainable_params)
-                logger.info(f"After clipping {global_step}: loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}")
-
-
-            if global_rank == 0: pbar.update(1)
-
-            if use_sparsity:
-                mask.step()  # performs optimizer.step() inside, then applies the mask
-                mask.lr_scheduler.step()
-                mask.optimizer.zero_grad()
-
-            else:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-            update_step += 1
-            local_step += 1
-            update_time = time.time() - update_time
-
-            # save checkpoint by save_every
-            if not args.no_save:
-                if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-                    if use_sparsity:
-                        save_model(model, mask.optimizer, mask.lr_scheduler, update_step, global_step, run_config,
-                                   tokens_seen, tokens_seen_before, update_time, args)
-
-                    else:
-                        save_model(model, optimizer, scheduler, update_step, global_step, run_config,
-                               tokens_seen, tokens_seen_before, update_time, args)
-
-            # evaluation
-            if update_step % args.eval_every == 0:
-                logger.info(f"Performing evaluation at epoch {epoch + 1} / step {update_step}")
-                total_loss, evaluated_on_tokens = evaluate_model(
-                    model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
-                )
-                perplexity = math.exp(total_loss)
-                if global_rank == 0:
-                    if args.wandb_used:
-                        wandb.log({
-                            "eval/eval_perplexity": perplexity,
-                            "eval/eval_loss": total_loss,
-                            "eval/eval_tokens": evaluated_on_tokens,
-                            },
-                            step=global_step,
-                        )
-                    logger.info(f"Eval at epoch {epoch + 1} / step {update_step}: "
-                                f"eval_loss {total_loss}  "
-                                f"perplexity {perplexity}  "
-                                f"tokens {evaluated_on_tokens}")
-
-            if use_sparsity:
-                lr = mask.optimizer.param_groups[0]["lr"]
-            else:
-                lr = optimizer.param_groups[0]["lr"]
-
-            tokens_in_update = tokens_seen - tokens_seen_before
-            tokens_seen_before = tokens_seen
-            batches_in_update = args.gradient_accumulation * world_size
+        ## resume
+        if args.resume and global_step <= start_step_global:
+            if global_step % args.gradient_accumulation == 0:
+                update_step += 1
 
             if global_rank == 0:
+                logger.info(f"start_step_global: {start_step_global}; global_step: {global_step}")
 
+            continue
+
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        labels = batch["input_ids"].clone()
+        labels[labels == pad_idx] = -100
+        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+        # Standard, single model
+        loss = model(**batch, labels=labels).loss
+        scaled_loss = loss / args.gradient_accumulation
+        scaled_loss.backward()
+
+        if global_step % args.gradient_accumulation != 0:
+            continue
+
+        # The below code is only executed during the update step, after a full gradient accumulation
+        # Check gradient norm validity, avoid data corruption
+        grad_norm = get_grad_norm(trainable_params)
+
+        # add grad clipping
+        if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+
+        ## check loss; global gradient norm !!!
+        if args.print_grad_norm:
+            # grad_norm = get_grad_norm(trainable_params)
+            logger.info(
+                f"After clipping {global_step}: training loss = {loss.item():.4f}, grad_norm = {grad_norm:.4f}")
+
+        if global_rank == 0: pbar.update(1)
+
+        if use_sparsity:
+            mask.step()  # performs optimizer.step() inside, then applies the mask
+            mask.lr_scheduler.step()
+            mask.optimizer.zero_grad()
+
+        else:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        update_step += 1
+        local_step += 1
+        update_time = time.time() - update_time
+
+        # save checkpoint by save_every
+        if not args.no_save:
+            if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+                if use_sparsity:
+                    save_model(model, mask.optimizer, mask.lr_scheduler, update_step, global_step, run_config,
+                               tokens_seen, tokens_seen_before, update_time, args)
+
+                else:
+                    save_model(model, optimizer, scheduler, update_step, global_step, run_config,
+                               tokens_seen, tokens_seen_before, update_time, args)
+
+        # evaluation
+        if update_step % args.eval_every == 0:
+            logger.info(f"Performing evaluation at step {update_step}")
+            total_loss, evaluated_on_tokens = evaluate_model(
+                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+            )
+            perplexity = math.exp(total_loss)
+            if global_rank == 0:
                 if args.wandb_used:
                     wandb.log({
-                        "train_loss": loss.item(),
-                        "lr": lr,
-                        "update_step": update_step,
-                        "tokens_seen": tokens_seen,
-                        "throughput_tokens": tokens_in_update / update_time,
-                        "throughput_examples": args.total_batch_size / update_time,
-                        "throughput_batches": batches_in_update / update_time,
-                        },
+                        "eval/eval_perplexity": perplexity,
+                        "eval/eval_loss": total_loss,
+                        "eval/eval_tokens": evaluated_on_tokens,
+                    },
                         step=global_step,
                     )
+                logger.info(f"Eval at step {update_step}: "
+                            f"eval_loss {total_loss}  "
+                            f"perplexity {perplexity}  "
+                            f"tokens {evaluated_on_tokens}")
 
-                if update_step % args.loss_every == 0:
+        if use_sparsity:
+            lr = mask.optimizer.param_groups[0]["lr"]
+            wd = mask.optimizer.param_groups[0]["weight_decay"]
+        else:
+            lr = optimizer.param_groups[0]["lr"]
+            wd = optimizer.param_groups[0]["weight_decay"]
 
-                    logger.info(f"Epoch {epoch + 1} / Step {update_step}: "
-                                f"lr {lr} "
-                                # f"lr {grad_norm.item()} "
-                                f"train_loss {loss.item()}  "
-                                f"tokens_seen {tokens_seen}")
+        tokens_in_update = tokens_seen - tokens_seen_before
+        tokens_seen_before = tokens_seen
+        batches_in_update = args.gradient_accumulation * world_size
 
-            update_time = time.time()
+        if global_rank == 0:
+
+            if args.wandb_used:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "lr": lr,
+                    "update_step": update_step,
+                    "tokens_seen": tokens_seen,
+                    "throughput_tokens": tokens_in_update / update_time,
+                    "throughput_examples": args.total_batch_size / update_time,
+                    "throughput_batches": batches_in_update / update_time,
+                },
+                    step=global_step,
+                )
+
+            if update_step % args.loss_every == 0:
+                logger.info(f"Step {update_step}: "
+                            f"lr {lr} "
+                            f"wd {wd} "
+                            f"train_loss {loss.item()}  "
+                            f"tokens_seen {tokens_seen}")
+
+        update_time = time.time()
+
+        if args.output_dir and update_step % args.save_step == 0:
+
+            logger.info(f"Performing evaluation for resuming at step {update_step}")
+            total_loss, evaluated_on_tokens = evaluate_model(
+                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+            )
+            perplexity = math.exp(total_loss)
+
+            if dist.get_rank() == 0:
+                # checkpoint_path = os.path.join(args.output_dir, 'checkpoint_latest.pth')
+                checkpoint_path = os.path.join(args.output_dir, 'checkpoint_iter{global_step}.pth')
+                model_to_save = model if args.single_gpu else model.module
+
+                logger.info(f"Checkpoint saved to {checkpoint_path} {total_loss}")
+                checkpoint_state = {
+                    'model': model_to_save.state_dict(),
+                    'args': args,
+                    'global_step': global_step,
+                    'save_step': update_step,
+                    "tokens_seen": tokens_seen,
+                    "tokens_seen_before": tokens_seen_before,
+                    "eval_loss": total_loss,
+                    "perplexity": perplexity,
+                }
+
+                if mask:
+                    checkpoint_state['masks'] = mask.masks
+                    checkpoint_state['masks_pre'] = mask.masks_pre
+                    checkpoint_state['mask_step'] = mask.steps
+                    checkpoint_state['optimizer']: mask.optimizer.state_dict()
+                    checkpoint_state['scheduler']: mask.lr_scheduler.state_dict()
+                else:
+                    checkpoint_state['optimizer']: optimizer.state_dict()
+                    checkpoint_state['scheduler']: scheduler.state_dict()
+
+                torch.save(checkpoint_state, checkpoint_path)
+                logger.info(
+                    f"Checkpoint saved to {checkpoint_path} at step {update_step}, perplexity {perplexity:.4f}")
 
     # ##############################
     # END of training loop
@@ -587,7 +706,7 @@ def main(args):
                 "final_eval/final_eval_perplexity": perplexity,
                 "final_eval/final_eval_loss": total_loss,
                 "final_eval/final_eval_tokens": evaluated_on_tokens,
-                },
+            },
                 step=global_step,
             )
         logger.info(f"Final eval loss: {total_loss} and perplexity: {perplexity} on tokens: {evaluated_on_tokens}")
@@ -595,7 +714,8 @@ def main(args):
     if not args.no_save and False:
         current_model_directory = f"{args.save_dir}/model_{args.epochs}_{update_step}_seed{args.seed}"
         if global_rank == 0 and not os.path.exists(current_model_directory):
-            logger.info(f"Saving model and optimizer to {current_model_directory}, epoch {args.epochs}, update step {update_step}")
+            logger.info(
+                f"Saving model and optimizer to {current_model_directory}, epoch {args.epochs}, update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
 
             if args.single_gpu:
@@ -607,7 +727,6 @@ def main(args):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "update_step": update_step,
-                "epoch": epoch+1,
                 "global_step": global_step,
                 "config": run_config,
                 # "wandb": wandb.run.dir,
@@ -618,7 +737,6 @@ def main(args):
             training_state_checkpoint = {
                 "global_step": global_step,
                 "update_step": update_step,
-                "epoch": epoch+1,
                 "tokens_seen": tokens_seen,
                 "tokens_seen_before": tokens_seen_before,
                 "update_time": update_time,

@@ -31,7 +31,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers.models.llama.configuration_llama import LlamaConfig
-
+from sparselearning.sparse_layer import SparseLinear
 
 logger = logging.get_logger(__name__)
 
@@ -149,9 +149,9 @@ class LlamaMLP(nn.Module):
         hidden_act: str,
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.gate_proj = SparseLinear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = SparseLinear(intermediate_size, hidden_size, bias=False)
+        self.up_proj = SparseLinear(hidden_size, intermediate_size, bias=False)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -180,10 +180,10 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = SparseLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = SparseLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = SparseLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = SparseLinear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -351,7 +351,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
+        if isinstance(module, SparseLinear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -635,7 +635,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         self.model = LlamaModel(config)
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = SparseLinear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -824,7 +824,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = LlamaModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.score = SparseLinear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
