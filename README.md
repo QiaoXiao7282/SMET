@@ -1,7 +1,7 @@
 # Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling
 
 
-This is the offical implementation for paper titled [Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling]().
+Official PyTorch implementation of [Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling]().
 
 ## Abstract
 
@@ -16,13 +16,6 @@ Extensive experiments demonstrate that SMET enables stable, scalable, and memory
 
 ## Usage
 
-```python
-from galore_torch import SPAM
-# define param groups as spam_params and non_spam_params
-param_groups = [{'params': non_spam_params}, 
-                {'params': spam_params, 'density': 1.0}]
-optimizer = SPAM(param_groups, lr=0.001,warmup_steps=150,threshold=5000,DeltaT=500)
-```
 
 ### Example 1: Training LLaMA-130M 
 
