@@ -635,7 +635,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         self.model = LlamaModel(config)
 
-        self.lm_head = SparseLinear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()

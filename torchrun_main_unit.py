@@ -16,13 +16,11 @@ import datasets.distributed
 import wandb
 from tqdm import tqdm
 from loguru import logger
-from datasets import load_from_disk
-from sparselearning.optimizer_new import Adam
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
-from peft_pretraining.modeling_llama import LlamaForCausalLM
-from sparselearning.core_index import Masking
+from peft_pretraining.modeling_llama_sparse import LlamaForCausalLM
+from sparselearning.core_dst import Masking
 
 transformers.logging.set_verbosity_error()
 
@@ -60,10 +58,10 @@ def parse_args(args):
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--activation_checkpointing", type=str2bool, default=False, help="")
+    parser.add_argument("--activation_checkpointing", type=str2bool, default=False)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_steps", type=int, default=1_000)
-    parser.add_argument("--eval_every", type=int, default=200)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--eval_every", type=int, default=2000)
     parser.add_argument("--loss_every", type=int, default=10)
 
     parser.add_argument("--total_training_steps", type=int, default=10_000,
@@ -83,7 +81,7 @@ def parse_args(args):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", type=str, default="test")
-    parser.add_argument("--grad_clipping", type=float, default=1.0)
+    parser.add_argument("--grad_clipping", type=float, default=0.0)
     parser.add_argument("--run_name", type=str, default="default")
     parser.add_argument("--single_gpu", type=str2bool, default=False, help="Disable DDP and use single GPU")
     parser.add_argument("--console_log", type=str, default="default")
@@ -96,21 +94,21 @@ def parse_args(args):
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
 
     ## optimizer
-    parser.add_argument("--init_sparse", type=str2bool, default=False, help="")
-    parser.add_argument('--op_decay_steps', type=int, default=1, help='decay steps for the regrow weights.')
+    parser.add_argument("--init_sparse", type=str2bool, default=False)
+    parser.add_argument('--op_decay_steps', type=int, default=100, help='decay steps for the regrow weights.')
     parser.add_argument('--op_decay_max', type=float, default=1.0, help='decay maximum for the regrow weights.')
-    parser.add_argument('--accumulate_grad_steps', type=float, default=5, help='accumulate gradient steps.')
+    parser.add_argument('--accumulate_grad_steps', type=float, default=1, help='accumulate gradient steps.')
     parser.add_argument('--maintain_num', type=float, default=2, help='accumulate gradient number.')
-    parser.add_argument("--use_norm_adjust", type=str2bool, default=False, help="")
-    parser.add_argument("--use_density_scale", type=str2bool, default=False, help="")
+    parser.add_argument("--use_norm_adjust", type=str2bool, default=False)
+    parser.add_argument("--use_density_scale", type=str2bool, default=False)
 
-    parser.add_argument("--mup_enabled", type=str2bool, default=False, help="")
-    parser.add_argument('--mup_width_multiplier', type=float, default=2, help='accumulate gradient number.')
-    parser.add_argument('--mup_input_alpha', type=float, default=5, help='accumulate gradient number.')
-    parser.add_argument('--mup_output_alpha', type=float, default=1, help='accumulate gradient number.')
+    parser.add_argument("--mup_enabled", type=str2bool, default=False, help="Default: False")
+    parser.add_argument('--mup_width_multiplier', type=float, default=2, help='Mup width')
+    parser.add_argument('--mup_input_alpha', type=float, default=5, help='Mup input alpha')
+    parser.add_argument('--mup_output_alpha', type=float, default=1, help='Mup output alpha')
 
     ## resume
-    parser.add_argument("--resume", type=str2bool, default=False, help="")
+    parser.add_argument("--resume", type=str2bool, default=False)
     parser.add_argument("--save_step", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default=None)
 
@@ -132,11 +130,11 @@ def parse_args(args):
                         help='Growth mode. Choose from: momentum, random, and momentum_neuron.')
     parser.add_argument('--prune', type=str, default='magnitude',
                         help='Pruning mode. Choose from: magnitude, SET, threshold.')
-    parser.add_argument('--reinit', type=str, default='no',
+    parser.add_argument('--reinit', type=str, default='zero',
                         help='Weight reinitialization mode. Choose from: no, zero, original.')
     parser.add_argument('--redistribution', type=str, default='none',
                         help='Redistribution mode. Choose from: momentum, magnitude, nonzeros, or none.')
-    parser.add_argument('--prune_rate', type=float, default=0.50, help='The pruning rate.')
+    parser.add_argument('--prune_rate', type=float, default=0.20, help='The pruning rate.')
     parser.add_argument('--prune_rate_decay', type=str, default='cosine',
                         help='The decay schedule for the pruning rate. Default: cosine. Choose from: cosine, linear.')
     parser.add_argument('--density_decay', type=str, default='constant',
@@ -153,12 +151,12 @@ def parse_args(args):
     parser.add_argument('--init_temperature', type=float, default=1,
                         help='The initial temperature for the temperature decay schedule. Only used when --temperature_decay != constant.')
 
-    parser.add_argument('--blocksize', type=int, default=4)
-    parser.add_argument("--lr_scale", type=str2bool, default=False, help="")
-    parser.add_argument("--reset_steps", type=str2bool, default=True, help="")
-    parser.add_argument("--mask_momentum", type=str2bool, default=True, help="")
+    parser.add_argument('--blocksize', type=int, default=1)
+    parser.add_argument("--lr_scale", type=str2bool, default=False, help="Learning rate scales outside. Default: False")
+    parser.add_argument("--reset_steps", type=str2bool, default=True, help="Reset local optimization age for regrown weights ")
+    parser.add_argument("--mask_momentum", type=str2bool, default=True, help="Start with zero momentum")
 
-    parser.add_argument("--compare_update", type=str2bool, default=False, help="")
+    parser.add_argument("--compare_update", type=str2bool, default=False, help="Compare the update")
 
     args = parser.parse_args(args)
     args = args_utils.check_args_torchrun_main(args)
@@ -217,7 +215,9 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
         if "lm_head" in name:
             logger.info(f"Parameter {name} has dtype {param.dtype}")
 
-    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True, trust_remote_code=True) #DGX
+    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True,
+                                     trust_remote_code=True)  # DGX
+
 
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -229,7 +229,6 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
         batched=True,
         remove_columns=["text"],  # ["text", "timestamp", "url"],
     )
-    # val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
     dataloader = torch.utils.data.DataLoader(
         val_data_mapped,
         batch_size=batch_size,
@@ -248,7 +247,6 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
             break
         total_batches += 1
 
-        # batch = default_data_collator(batch)
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
@@ -404,6 +402,10 @@ def main(args):
     else:
         model = model.to(device=device)
 
+    for n, p in model.named_parameters():
+        if "lm_head" in n:
+            p.requires_grad = True
+
     n_total_params = sum(p.numel() for p in model.parameters())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -447,13 +449,6 @@ def main(args):
     else:
         if args.optimizer.lower() == "adam":
             optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-        elif args.optimizer.lower() == "adamw":
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
-                                          betas=(args.beta1, args.beta2))
-
-        elif args.optimizer.lower() == "adamdst":
-            optimizer = Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay,
-                             betas=(args.beta1, args.beta2))
 
         else:
             raise ValueError(f"Optimizer {args.optimizer} not supported")
@@ -569,7 +564,7 @@ def main(args):
         if use_sparsity:
             mask.step()  # performs optimizer.step() inside, then applies the mask
             mask.lr_scheduler.step()
-            mask.optimizer.zero_grad()
+            mask.optimizer.zero_grad(set_to_none=True)
 
         else:
             optimizer.step()
