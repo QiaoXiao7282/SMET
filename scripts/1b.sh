@@ -2,8 +2,8 @@
 #SBATCH -p gpu_h100
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --gpus=4
+#SBATCH --gpus-per-node=8
+#SBATCH --gpus=8
 #SBATCH -t 24:00:00
 
 set -euo pipefail
@@ -22,7 +22,7 @@ source activate env
 size="1b"
 density=0.5
 training_steps=100000
-batch=128
+batch=64
 learning_rate=1.0e-3
 
 optimizer="adamdst"
@@ -51,7 +51,7 @@ echo "[job] log_file=${log_file}"
 
 torchrun \
     --standalone \
-    --nproc_per_node=4 \
+    --nproc_per_node=8 \
     torchrun_main_unit.py \
     --wandb_mode disabled \
     --model_config "configs/llama_${size}.json" \

@@ -1,7 +1,7 @@
 # Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling
 
 
-Official PyTorch implementation of [Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling]().
+This repository contains the official code for [Memory-Efficient LLMs Training with Dynamic Sparsity: From Stability to Practical Scaling](https://arxiv.org/abs/2606.00888).
 
 ## Abstract
 
